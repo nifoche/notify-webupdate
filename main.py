@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SNS Update Monitor - Main Script
-SNSの更新を監視し、新着投稿をLINEとメールで通知する
+SNS/Webページの更新を監視し、新着投稿をLINEとメールで通知する
 """
 
 import asyncio
@@ -12,12 +12,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, Page
 
 from database import Database
 from notifier import send_line_notification, send_email_notification
+from scrapers import SumaiScraper, TwitterScraper, FacebookScraper
 
 # 環境変数の読み込み
 load_dotenv()
@@ -38,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 class SNSMonitor:
-    """SNS更新監視クラス"""
+    """SNS/Webページ更新監視クラス"""
 
     def __init__(self):
         self.target_urls = self._parse_urls()
@@ -51,41 +53,32 @@ class SNSMonitor:
         urls_str = os.getenv('TARGET_URLS', '')
         return [url.strip() for url in urls_str.split(',') if url.strip()]
 
-    async def fetch_posts(self, page: Page, url: str) -> List[Dict[str, str]]:
+    def _create_scraper(self, url: str):
         """
-        SNSページから投稿を取得する（汎用実装）
+        URLに応じたスクレイパーを作成
 
-        注意: 実際にはSNSごとにスクレイピングロジックを実装する必要があります
-        これはサンプル実装です
+        Args:
+            url: ターゲットURL
+
+        Returns:
+            スクレーパーインスタンス
         """
-        try:
-            await page.goto(url, wait_until='networkidle', timeout=30000)
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
 
-            # サンプル: ページタイトルを取得（実際には投稿データを取得）
-            # 実装例: Twitter/X, Facebook等のセレクタを指定
-            posts = []
-
-            # TODO: SNSごとのセレクタを実装
-            # 例: Twitterの場合
-            # post_elements = await page.query_selector_all('article[data-testid="tweet"]')
-            # for element in post_elements:
-            #     post_id = await element.get_attribute('aria-labelledby')
-            #     content = await element.inner_text()
-            #     posts.append({'id': post_id, 'content': content})
-
-            # サンプルデータ（開発用）
-            sample_id = f"sample_{datetime.now().isoformat()}"
-            posts.append({
-                'id': sample_id,
-                'content': f'Sample post from {url}',
-                'url': url
-            })
-
-            return posts
-
-        except Exception as e:
-            logger.error(f"Failed to fetch posts from {url}: {e}")
-            return []
+        # 31sumai
+        if '31sumai.com' in domain:
+            return SumaiScraper(url)
+        # Twitter/X
+        elif 'twitter.com' in domain or 'x.com' in domain:
+            return TwitterScraper(url)
+        # Facebook
+        elif 'facebook.com' in domain:
+            return FacebookScraper(url)
+        # デフォルト（汎用）
+        else:
+            logger.warning(f"No specific scraper for {domain}, using generic scraper")
+            return GenericScraper(url)
 
     async def monitor(self):
         """監視メインループ"""
@@ -96,14 +89,20 @@ class SNSMonitor:
 
             for url in self.target_urls:
                 try:
+                    # スクレイパーを取得
+                    scraper = self._create_scraper(url)
+
                     # 軽量ページを作成（画像・フォント読み込み無効）
                     page = await browser.new_page()
 
-                    await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}",
-                                    lambda route: route.abort())
+                    # ページ設定
+                    if hasattr(scraper, 'setup_page'):
+                        await scraper.setup_page(page)
+                    else:
+                        await self._setup_page_generic(page)
 
                     # 投稿取得
-                    posts = await self.fetch_posts(page, url)
+                    posts = await scraper.fetch_posts(page)
 
                     if not posts:
                         logger.info(f"No posts found for {url}")
@@ -120,7 +119,13 @@ class SNSMonitor:
                             logger.info(f"New post detected: {post_id}")
 
                             # 通知送信
-                            await self._send_notifications(post_id, content, post_url, url)
+                            await self._send_notifications(
+                                post_id,
+                                content,
+                                post_url,
+                                url,
+                                scraper.get_site_name()
+                            )
 
                             # データベースに保存
                             self.db.save_post(post_id, content)
@@ -137,13 +142,17 @@ class SNSMonitor:
 
         logger.info(f"Monitor cycle completed. Next check in {self.check_interval}s")
 
-    async def _send_notifications(self, post_id: str, content: str, post_url: str, site_url: str):
-        """LINEとメールで通知を送信"""
-        site_name = self._extract_site_name(site_url)
+    async def _setup_page_generic(self, page: Page):
+        """汎用ページ設定（画像・フォント読み込み無効）"""
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}",
+                        lambda route: route.abort())
 
+    async def _send_notifications(self, post_id: str, content: str, post_url: str,
+                                  site_url: str, site_name: str):
+        """LINEとメールで通知を送信"""
         # LINE通知
         try:
-            message = f"【SNS更新通知】\n\nサイト: {site_name}\n\n{content}\n\n{post_url}"
+            message = f"【更新通知】\n\nサイト: {site_name}\n\n{content}\n\n{post_url}"
             await send_line_notification(message)
             logger.info(f"LINE notification sent for post {post_id}")
         except Exception as e:
@@ -151,9 +160,9 @@ class SNSMonitor:
 
         # メール通知
         try:
-            subject = f"【SNS更新通知】{site_name}"
+            subject = f"【更新通知】{site_name}"
             body = f"""サイト: {site_name}
-投稿内容: {content}
+内容: {content}
 URL: {post_url}
 取得時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -161,12 +170,6 @@ URL: {post_url}
             logger.info(f"Email notification sent for post {post_id}")
         except Exception as e:
             logger.error(f"Failed to send email notification: {e}")
-
-    def _extract_site_name(self, url: str) -> str:
-        """URLからサイト名を抽出"""
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        return parsed.netloc.replace('www.', '')
 
     def _add_random_delay(self):
         """アンチブロックのためのランダム待機"""
@@ -191,6 +194,37 @@ URL: {post_url}
         except Exception as e:
             logger.error(f"Monitor crashed: {e}", exc_info=True)
             raise
+
+
+class GenericScraper:
+    """汎用スクレイパー（フォールバック用）"""
+
+    def __init__(self, url: str):
+        self.url = url
+
+    def get_site_name(self) -> str:
+        from urllib.parse import urlparse
+        parsed = urlparse(self.url)
+        return parsed.netloc.replace('www.', '')
+
+    async def fetch_posts(self, page: Page) -> List[Dict[str, str]]:
+        """ページのタイトルを取得（汎用実装）"""
+        await page.goto(self.url, wait_until='networkidle', timeout=30000)
+
+        # ページタイトルを取得
+        title = await page.title()
+        timestamp = datetime.now().isoformat()
+
+        return [{
+            'id': f"generic_{timestamp}",
+            'content': f"ページ更新: {title}",
+            'url': self.url
+        }]
+
+    async def setup_page(self, page: Page):
+        """画像・フォント読み込み無効"""
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}",
+                        lambda route: route.abort())
 
 
 async def main():
