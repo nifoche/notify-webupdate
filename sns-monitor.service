@@ -1,0 +1,15 @@
+[Unit]
+Description=SNS Update Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/dev/tools/notify-webupdate
+Environment="PATH=/path/to/dev/tools/notify-webupdate/venv/bin"
+ExecStart=/path/to/dev/tools/notify-webupdate/venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
