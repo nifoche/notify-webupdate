@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  monitor:
+    build: .
+    container_name: notify-webupdate-monitor
+    restart: always  # コンテナ停止時も自動再起動
+    volumes:
+      # データ永続化（SQLite DB、ログなど）
+      - ./data:/app/data
+      # .envファイルをマウント（環境変数用）
+      - ./.env:/app/.env:ro
+    environment:
+      # コンテナ内環境変数
+      - TZ=Asia/Tokyo
+      - PYTHONUNBUFFERED=1
+    # ログ設定
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:
+    driver: local
